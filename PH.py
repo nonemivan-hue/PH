@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from yt_dlp import YoutubeDL
+import queue
 import os
 import platform
 import requests
@@ -28,6 +29,28 @@ else:
     raise OSError("Unsupported operating system")
 
 FFMPEG_PATH = os.path.join(PH_DOWNLOAD_DIR, FFMPEG_NAME)
+
+# Очередь сообщений от фоновых потоков в интерфейс (обработчик запускается позже)
+ui_queue = queue.Queue()
+
+
+def _process_ui_queue():
+    """Обрабатывает сообщения из фонового потока в главном цикле Tk."""
+    try:
+        while True:
+            func = ui_queue.get_nowait()
+            try:
+                func()
+            except Exception:
+                pass
+    except queue.Empty:
+        pass
+    root.after(50, _process_ui_queue)
+
+
+def post_to_ui(func):
+    """Безопасно передаёт колбэк для выполнения в потоке интерфейса."""
+    ui_queue.put(func)
 
 # Функция для загрузки и установки FFmpeg
 def setup_ffmpeg():
@@ -96,12 +119,26 @@ progress_bar = None
 status_label = None
 progress_bar_var = None
 
+# Варианты выбора качества видео: отображаемый текст -> формат yt-dlp
+QUALITY_OPTIONS = {
+    "Лучшее качество": "bestvideo+bestaudio/best",
+    "2160p (4K)": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+    "1440p (2K)": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+    "1080p (Full HD)": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720p (HD)": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+}
+
+# Количество параллельных потоков загрузки фрагментов
+CONCURRENT_CONNECTIONS = 8
+
 
 def set_progress(percent):
     """Обновляет индикатор выполнения (0-100) и метку процента."""
     percent = max(0.0, min(float(percent), 100.0))
     if progress_bar_var is not None:
-        root.after(0, lambda p=percent: progress_bar_var.set(p))
+        post_to_ui(lambda p=percent: progress_bar_var.set(p))
 
 
 def set_ui_state(downloading):
@@ -111,15 +148,16 @@ def set_ui_state(downloading):
         def _apply():
             download_button.configure(state=state)
             paste_button.configure(state=state)
+            quality_combo.configure(state='disabled' if downloading else 'readonly')
             url_entry.configure(state='readonly' if downloading else 'normal')
-        root.after(0, _apply)
+        post_to_ui(_apply)
 
 
 def print_info(message):
     """Выводит информационное сообщение в статус-бар и консоль."""
     print(message)
     if status_label is not None:
-        root.after(0, lambda: status_label.configure(text=message))
+        post_to_ui(lambda: status_label.configure(text=message))
 
 
 class DownloadProgressLogger:
@@ -175,7 +213,9 @@ class DownloadProgressLogger:
             eta = d.get('eta')
             if total and done is not None:
                 percent = min(done * 100.0 / total, 100.0)
-                if abs(percent - self.last_percent) >= 0.99 or percent >= 100:
+                # При многопоточной загрузке (несколько соединений) проценты
+                # могут «прыгать» между потоками — показываем только рост прогресса
+                if percent >= 100 or percent - self.last_percent >= 0.99:
                     self.last_percent = percent
                     set_progress(percent)
                     speed_txt = f" {speed / 1024 / 1024:.2f} МБ/с" if speed else ""
@@ -183,6 +223,11 @@ class DownloadProgressLogger:
                     mb_done = done / 1024 / 1024
                     mb_total = total / 1024 / 1024
                     print_info(f"Скачивание {percent:.1f}% ({mb_done:.1f} из {mb_total:.1f} МБ){speed_txt}{eta_txt}")
+        elif status == 'started':
+            info = d.get('info_dict') or {}
+            height = info.get('height')
+            if height:
+                print_info(f"Загружаемое качество: {height}p")
         elif status == 'finished':
             print_info("Загрузка потока завершена. Обработка...")
         elif status == 'error':
@@ -199,19 +244,23 @@ class DownloadProgressLogger:
 def download_video():
     url = url_entry.get()
     save_path = filedialog.askdirectory(title="Выберите папку для сохранения")
-    
+
     if not url:
         messagebox.showerror("Ошибка", "Введите URL видео!")
         return
-    
+
     if not save_path:
         messagebox.showerror("Ошибка", "Выберите папку для сохранения!")
         return
-    
+
+    # Выбранное качество видео
+    quality_label = quality_var.get()
+    fmt = QUALITY_OPTIONS.get(quality_label, "bestvideo+bestaudio/best")
+
     # Блокируем интерфейс и запускаем скачивание в отдельном потоке
     set_ui_state(True)
     set_progress(0)
-    print_info("Подготовка к скачиванию...")
+    print_info(f"Подготовка к скачиванию (качество: {quality_label})...")
 
     def worker():
         try:
@@ -222,7 +271,7 @@ def download_video():
 
             ydl_opts = {
                 'outtmpl': f'{save_path}/%(title)s.%(ext)s',
-                'format': 'bestvideo+bestaudio/best',
+                'format': fmt,
                 'merge_output_format': 'mp4',
                 'ffmpeg_location': FFMPEG_PATH,
                 'postprocessors': [{
@@ -232,6 +281,10 @@ def download_video():
                 'logger': logger,
                 'progress_hooks': [logger.update_progress],
                 'noplaylist': True,
+                # Многопоточная загрузка: файл разбивается на фрагменты,
+                # которые скачиваются параллельно в несколько потоков
+                'concurrent_fragment_downloads': CONCURRENT_CONNECTIONS,
+                'http_chunk_size': 10 * 1024 * 1024,  # 10 МБ на фрагмент
             }
 
             with YoutubeDL(ydl_opts) as ydl:
@@ -240,10 +293,11 @@ def download_video():
 
             set_progress(100)
             print_info("Готово!")
-            root.after(0, lambda: messagebox.showinfo("Успех", "Видео успешно скачано в максимальном качестве!"))
+            post_to_ui(lambda: messagebox.showinfo(
+                "Успех", f"Видео успешно скачано в качестве «{quality_label}»!"))
         except Exception as e:
             print_info(f"Ошибка: {str(e)}")
-            root.after(0, lambda err=e: messagebox.showerror("Ошибка", f"Произошла ошибка: {str(err)}"))
+            post_to_ui(lambda err=e: messagebox.showerror("Ошибка", f"Произошла ошибка: {str(err)}"))
         finally:
             set_ui_state(False)
 
@@ -280,6 +334,22 @@ def set_custom_theme(root):
                     troughcolor='#2d2d2d', background='#ff9900',
                     lightcolor='#ff9900', darkcolor='#ff9900', borderwidth=0)
 
+    # Выбор качества (Combobox)
+    style.configure('Quality.TCombobox',
+                    fieldbackground='#2d2d2d', background='#2d2d2d',
+                    foreground='#ffffff', arrowcolor='#ff9900',
+                    font=('Helvetica', 11, 'bold'), padding=6,
+                    borderwidth=0, relief='flat')
+    style.map('Quality.TCombobox',
+              fieldbackground=[('readonly', '#2d2d2d'), ('disabled', '#222222')],
+              foreground=[('readonly', '#ff9900'), ('disabled', '#666666')],
+              selectbackground=[('readonly', '#2d2d2d')],
+              selectforeground=[('readonly', '#ff9900')])
+    root.option_add('*TCombobox*Listbox.background', '#2d2d2d')
+    root.option_add('*TCombobox*Listbox.foreground', '#ffffff')
+    root.option_add('*TCombobox*Listbox.selectBackground', '#ff9900')
+    root.option_add('*TCombobox*Listbox.selectForeground', '#000000')
+
     # Статус-бар
     style.configure('Status.TLabel', background='#111111', foreground='#bbbbbb',
                    font=('Helvetica', 10))
@@ -296,7 +366,7 @@ def paste_url():
 # Создание интерфейса
 root = tk.Tk()
 root.title("PornHub Video Downloader")
-root.geometry("700x380")
+root.geometry("700x440")
 root.resizable(False, False)
 
 # Применение темы
@@ -319,6 +389,19 @@ url_entry.pack(side='left', fill='x', expand=True, padx=(0, 10))
 
 paste_button = ttk.Button(input_frame, text="Вставить", command=paste_url, style='Paste.TButton')
 paste_button.pack(side='left')
+
+# Выбор качества видео
+quality_frame = ttk.Frame(main_frame)
+quality_frame.pack(fill='x', pady=(5, 0))
+
+quality_label_caption = ttk.Label(quality_frame, text="Качество:", font=('Helvetica', 12, 'bold'))
+quality_label_caption.pack(side='left', padx=(0, 10))
+
+quality_var = tk.StringVar(value="Лучшее качество")
+quality_combo = ttk.Combobox(quality_frame, textvariable=quality_var,
+                             values=list(QUALITY_OPTIONS.keys()),
+                             state='readonly', width=20, style='Quality.TCombobox')
+quality_combo.pack(side='left')
 
 # Кнопка скачивания
 download_button = ttk.Button(main_frame, text="Скачать видео", command=download_video, style='Download.TButton')
@@ -354,4 +437,5 @@ progress_bar.configure(variable=progress_bar_var)
 progress_bar_var.trace_add('write', update_percent_label)
 
 # Запуск
+_process_ui_queue()
 root.mainloop()
