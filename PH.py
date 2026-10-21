@@ -7,6 +7,7 @@ import requests
 import zipfile
 import shutil
 import stat
+import threading
 
 # Определение платформы
 OS_TYPE = platform.system()
@@ -46,10 +47,22 @@ def setup_ffmpeg():
             zip_path = os.path.join(PH_DOWNLOAD_DIR, 'ffmpeg.tar.xz')
         
         # Скачивание FFmpeg
+        print_info(f"FFmpeg не найден. Скачивание: {url}")
         response = requests.get(url, stream=True)
+        response.raise_for_status()
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
         with open(zip_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size:
+                        percent = downloaded * 100 / total_size
+                        mb_done = downloaded / (1024 * 1024)
+                        mb_total = total_size / (1024 * 1024)
+                        print_info(f"Загрузка FFmpeg: {percent:.1f}% ({mb_done:.1f} МБ из {mb_total:.1f} МБ)")
+        print_info("Загрузка FFmpeg завершена.")
         
         # Распаковка
         if OS_TYPE == "Linux":
@@ -78,6 +91,110 @@ def setup_ffmpeg():
         # Удаление временных файлов
         os.remove(zip_path)
 
+# Элементы интерфейса для отображения процесса скачивания (создаются позже)
+progress_bar = None
+status_label = None
+progress_bar_var = None
+
+
+def set_progress(percent):
+    """Обновляет индикатор выполнения (0-100) и метку процента."""
+    percent = max(0.0, min(float(percent), 100.0))
+    if progress_bar_var is not None:
+        root.after(0, lambda p=percent: progress_bar_var.set(p))
+
+
+def set_ui_state(downloading):
+    """Блокирует/разблокирует элементы управления на время скачивания."""
+    if download_button is not None:
+        state = 'disabled' if downloading else 'normal'
+        def _apply():
+            download_button.configure(state=state)
+            paste_button.configure(state=state)
+            url_entry.configure(state='readonly' if downloading else 'normal')
+        root.after(0, _apply)
+
+
+def print_info(message):
+    """Выводит информационное сообщение в статус-бар и консоль."""
+    print(message)
+    if status_label is not None:
+        root.after(0, lambda: status_label.configure(text=message))
+
+
+class DownloadProgressLogger:
+    """Логгер yt-dlp, выводящий процесс скачивания в интерфейс."""
+    def __init__(self):
+        self.filename = ''
+        self.last_percent = -1
+
+    def debug(self, msg):
+        # yt-dlp отправляет служебные сообщения через tqdm — не выводим их
+        pass
+
+    def info(self, msg):
+        text = str(msg)
+        if text.startswith('[download]'):
+            if 'Destination:' in text:
+                name = text.split('Destination:', 1)[-1].strip()
+                self.filename = os.path.basename(name)
+                print_info(f"Файл: {self.filename}")
+            elif 'has already been downloaded' in text:
+                print_info("Файл уже был скачан ранее.")
+            elif '%' in text and ' of ' in text:
+                try:
+                    percent = float(text.split('%', 1)[0].replace('[download]', '').strip())
+                    speed_part = ''
+                    if ' at ' in text:
+                        rest = text.split(' at ', 1)[1]
+                        speed_part = ' Скорость: ' + rest.split(' ETA')[0].strip()
+                    eta_part = ''
+                    if ' ETA ' in text:
+                        eta_part = ' Осталось: ' + text.split(' ETA ', 1)[1].strip()
+                    # Обновляем индикатор при каждом прогрессе (не чаще 1 раза на процент)
+                    if abs(percent - self.last_percent) >= 0.99 or percent >= 100:
+                        self.last_percent = percent
+                        set_progress(percent)
+                        print_info(f"Скачивание {percent:.1f}%{speed_part}{eta_part}")
+                except (IndexError, ValueError):
+                    pass
+            elif 'Finished downloading' in text:
+                print_info("Загрузка потока завершена.")
+        elif text.startswith('[Merger]') or 'Merging formats' in text:
+            print_info("Объединение видео и аудио (FFmpeg)...")
+        elif 'Extracting' in text:
+            print_info("Извлечение информации о видео...")
+
+    def update_progress(self, d):
+        """Progress-hook yt-dlp: точный процент из словаря состояния."""
+        status = d.get('status')
+        if status == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            done = d.get('downloaded_bytes') or 0
+            speed = d.get('speed') or 0
+            eta = d.get('eta')
+            if total and done is not None:
+                percent = min(done * 100.0 / total, 100.0)
+                if abs(percent - self.last_percent) >= 0.99 or percent >= 100:
+                    self.last_percent = percent
+                    set_progress(percent)
+                    speed_txt = f" {speed / 1024 / 1024:.2f} МБ/с" if speed else ""
+                    eta_txt = f" ETA {eta} c" if eta is not None else ""
+                    mb_done = done / 1024 / 1024
+                    mb_total = total / 1024 / 1024
+                    print_info(f"Скачивание {percent:.1f}% ({mb_done:.1f} из {mb_total:.1f} МБ){speed_txt}{eta_txt}")
+        elif status == 'finished':
+            print_info("Загрузка потока завершена. Обработка...")
+        elif status == 'error':
+            print_info("Ошибка при загрузке фрагмента, повторная попытка...")
+
+    def warning(self, msg):
+        print(f"[Предупреждение] {msg}")
+
+    def error(self, msg):
+        print(f"[Ошибка] {msg}")
+
+
 # Функция для скачивания видео
 def download_video():
     url = url_entry.get()
@@ -91,30 +208,46 @@ def download_video():
         messagebox.showerror("Ошибка", "Выберите папку для сохранения!")
         return
     
-    # Убедимся, что FFmpeg установлен
-    try:
-        setup_ffmpeg()
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось установить FFmpeg: {str(e)}")
-        return
-    
-    ydl_opts = {
-        'outtmpl': f'{save_path}/%(title)s.%(ext)s',
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'ffmpeg_location': FFMPEG_PATH,
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
-    }
-    
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        messagebox.showinfo("Успех", "Видео успешно скачано в максимальном качестве!")
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}")
+    # Блокируем интерфейс и запускаем скачивание в отдельном потоке
+    set_ui_state(True)
+    set_progress(0)
+    print_info("Подготовка к скачиванию...")
+
+    def worker():
+        try:
+            # Убедимся, что FFmpeg установлен
+            setup_ffmpeg()
+
+            logger = DownloadProgressLogger()
+
+            ydl_opts = {
+                'outtmpl': f'{save_path}/%(title)s.%(ext)s',
+                'format': 'bestvideo+bestaudio/best',
+                'merge_output_format': 'mp4',
+                'ffmpeg_location': FFMPEG_PATH,
+                'postprocessors': [{
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': 'mp4',
+                }],
+                'logger': logger,
+                'progress_hooks': [logger.update_progress],
+                'noplaylist': True,
+            }
+
+            with YoutubeDL(ydl_opts) as ydl:
+                print_info("Получение информации о видео...")
+                ydl.download([url])
+
+            set_progress(100)
+            print_info("Готово!")
+            root.after(0, lambda: messagebox.showinfo("Успех", "Видео успешно скачано в максимальном качестве!"))
+        except Exception as e:
+            print_info(f"Ошибка: {str(e)}")
+            root.after(0, lambda err=e: messagebox.showerror("Ошибка", f"Произошла ошибка: {str(err)}"))
+        finally:
+            set_ui_state(False)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 # Настройка современного дизайна
 def set_custom_theme(root):
@@ -142,6 +275,15 @@ def set_custom_theme(root):
              background=[('active', '#444444')],
              foreground=[('active', '#ffaa33')])
 
+    # Индикатор выполнения
+    style.configure('Custom.Horizontal.TProgressbar',
+                    troughcolor='#2d2d2d', background='#ff9900',
+                    lightcolor='#ff9900', darkcolor='#ff9900', borderwidth=0)
+
+    # Статус-бар
+    style.configure('Status.TLabel', background='#111111', foreground='#bbbbbb',
+                   font=('Helvetica', 10))
+
 # Функция для вставки ссылки из буфера обмена
 def paste_url():
     try:
@@ -154,7 +296,7 @@ def paste_url():
 # Создание интерфейса
 root = tk.Tk()
 root.title("PornHub Video Downloader")
-root.geometry("700x300")
+root.geometry("700x380")
 root.resizable(False, False)
 
 # Применение темы
@@ -162,7 +304,7 @@ set_custom_theme(root)
 
 # Основной фрейм
 main_frame = ttk.Frame(root)
-main_frame.pack(expand=True, fill='both', padx=20, pady=20)
+main_frame.pack(expand=True, fill='both', padx=20, pady=(20, 10))
 
 # Заголовок
 title_label = ttk.Label(main_frame, text="PornHub Video Downloader", font=('Helvetica', 24, 'bold'), foreground='#ff9900')
@@ -180,7 +322,36 @@ paste_button.pack(side='left')
 
 # Кнопка скачивания
 download_button = ttk.Button(main_frame, text="Скачать видео", command=download_video, style='Download.TButton')
-download_button.pack(pady=20)
+download_button.pack(pady=10)
+
+# Индикатор процесса скачивания
+progress_frame = ttk.Frame(main_frame)
+progress_frame.pack(fill='x', pady=(10, 0))
+
+progress_bar = ttk.Progressbar(progress_frame, orient='horizontal', length=100,
+                               mode='determinate', maximum=100,
+                               style='Custom.Horizontal.TProgressbar')
+progress_bar.pack(fill='x', side='left', expand=True)
+
+percent_label = ttk.Label(progress_frame, text="0%", width=6, anchor='e')
+percent_label.pack(side='left', padx=(10, 0))
+
+# Статус-бар с информационным процессом скачивания
+status_frame = tk.Frame(root, bg='#111111')
+status_frame.pack(fill='x', side='bottom')
+
+status_label = ttk.Label(status_frame, text="Готов к работе. Вставьте ссылку и нажмите «Скачать видео».",
+                         anchor='w', style='Status.TLabel')
+status_label.pack(fill='x', padx=10, pady=5)
+
+
+def update_percent_label(*args):
+    """Синхронизирует текстовую метку процента с индикатором."""
+    percent_label.configure(text=f"{progress_bar_var.get():.0f}%")
+
+progress_bar_var = tk.DoubleVar()
+progress_bar.configure(variable=progress_bar_var)
+progress_bar_var.trace_add('write', update_percent_label)
 
 # Запуск
 root.mainloop()
